@@ -67,6 +67,11 @@ def cached_team_picks(manager_ids, cap_index, gw, team_label, _player_map, manag
     return engine.fetch_team_picks(manager_ids, cap_index, gw, team_label, _player_map, managers)
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_fixture_kickoffs(gw: int):
+    return engine.get_fixture_kickoffs(gw)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_histories(manager_ids):
     return engine.get_all_season_histories(manager_ids)
@@ -200,7 +205,7 @@ rows          = res["rows"]
 total_a = team_total(picks_a, cap_a_idx, live_scores)
 total_b = team_total(picks_b, cap_b_idx, live_scores)
 
-tab_names = ["Scoreboard", "Team Totals", "Differential & Swing", "Points Race"]
+tab_names = ["Scoreboard", "GW Race", "Team Totals", "Differential & Swing", "Season Trend"]
 if not settings["no_chips"]:
     tab_names.append("Chip Tracker")
 if not settings["no_summary"]:
@@ -349,7 +354,124 @@ with tabs["Differential & Swing"]:
 
 
 # ── Points race ────────────────────────────────────────────────────────────────
-with tabs["Points Race"]:
+# ── GW Race (in-gameweek live race) ──────────────────────────────────────────
+STAT_ICON = {
+    "goals_scored": "⚽", "assists": "🅰", "clean_sheets": "🛡",
+    "saves": "🧤", "penalties_saved": "🧤", "bonus": "⭐", "minutes": "⏱",
+    "goals_conceded": "❌", "yellow_cards": "🟨", "red_cards": "🟥",
+    "own_goals": "😬", "penalties_missed": "❌", "bps": "📊",
+}
+HEAVY_THRESHOLD = 10  # aggregate per-player swing (pts) to count as "heavy differential"
+
+with tabs["GW Race"]:
+    st.markdown(f"##### ⚡ GW{gw} — Live Points Race")
+    st.caption(f"{league_name_a} vs {league_name_b} · every scoring event this gameweek, in order")
+
+    fixture_ko = cached_fixture_kickoffs(gw)
+    timeline = engine.build_intra_gw_timeline(
+        picks_a, picks_b, player_map, res["live_explain"], live_scores, fixture_ko,
+    )
+
+    if not timeline:
+        st.info(
+            "No live scoring events yet for this gameweek. This fills in once matches "
+            "kick off (or turn off **Skip live scores** in the sidebar if that's enabled)."
+        )
+    else:
+        x       = list(range(len(timeline) + 1))
+        sc_a    = [0] + [e["score_a_after"] for e in timeline]
+        sc_b    = [0] + [e["score_b_after"] for e in timeline]
+        lead    = [a - b for a, b in zip(sc_a, sc_b)]
+        labels  = ["Kickoff"] + [
+            f'{STAT_ICON.get(e["stat"], "")} {e["name"]} · {engine.STAT_LABELS.get(e["stat"], e["stat"])} '
+            f'({"+" if e["raw_points"] >= 0 else ""}{e["raw_points"]}pts)'
+            for e in timeline
+        ]
+
+        # Aggregate total swing per player across the whole GW so far
+        player_swing = {}
+        for idx, e in enumerate(timeline, start=1):
+            pid = e["player_id"]
+            slot = player_swing.setdefault(pid, {"name": e["name"], "swing": 0, "last_idx": idx})
+            slot["swing"] += e["pts_swing_a"] - e["pts_swing_b"]
+            slot["last_idx"] = idx
+        heavy = {pid: v for pid, v in player_swing.items() if abs(v["swing"]) >= HEAVY_THRESHOLD}
+
+        # ── Chart 1: lead margin, diverging fill (the "race") ────────────────
+        lead_pos = [v if v > 0 else 0 for v in lead]
+        lead_neg = [v if v < 0 else 0 for v in lead]
+        fig = go.Figure()
+        fig.add_scatter(x=x, y=lead_pos, mode="lines", line=dict(shape="hv", color="#1a8754", width=0),
+                         fill="tozeroy", fillcolor="rgba(26,135,84,0.28)", name=league_name_a, hoverinfo="skip")
+        fig.add_scatter(x=x, y=lead_neg, mode="lines", line=dict(shape="hv", color="#0e7490", width=0),
+                         fill="tozeroy", fillcolor="rgba(14,116,144,0.28)", name=league_name_b, hoverinfo="skip")
+        fig.add_scatter(x=x, y=lead, mode="lines+markers", line=dict(shape="hv", color="#e5e7eb", width=1.5),
+                         marker=dict(size=4, color="#e5e7eb"), name="Lead", hovertext=labels,
+                         hovertemplate="%{hovertext}<br><b>Lead: %{y:+d}</b><extra></extra>")
+
+        for pid, v in heavy.items():
+            idx = v["last_idx"]
+            fig.add_scatter(
+                x=[idx], y=[lead[idx]], mode="markers+text", showlegend=False,
+                marker=dict(size=15, symbol="star", color="#f59e0b" if v["swing"] > 0 else "#f43f5e",
+                            line=dict(width=1.5, color="white")),
+                text=[f'{v["name"]} {v["swing"]:+d}'], textposition="top center",
+                textfont=dict(size=11, color="#e5e7eb"),
+                hovertemplate=f'<b>{v["name"]}</b><br>Total swing so far: {v["swing"]:+d} pts<extra></extra>',
+            )
+
+        fig.add_hline(y=0, line_dash="dot", line_color="#6b7280")
+        fig.update_layout(
+            height=420, margin=dict(l=0, r=0, t=30, b=0),
+            xaxis=dict(title="Scoring events (chronological)", showticklabels=False),
+            yaxis_title=f"◀ {league_name_b}     Lead     {league_name_a} ▶",
+            legend=dict(orientation="h", y=1.12, x=0),
+            plot_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig, width="stretch")
+
+        # ── Chart 2: raw score race ────────────────────────────────────────────
+        fig2 = go.Figure()
+        fig2.add_scatter(x=x, y=sc_a, mode="lines+markers", line=dict(shape="hv", color="#1a8754", width=3),
+                          marker=dict(size=4), name=league_name_a, hovertext=labels,
+                          hovertemplate="%{hovertext}<br>%{y} pts<extra></extra>")
+        fig2.add_scatter(x=x, y=sc_b, mode="lines+markers", line=dict(shape="hv", color="#0e7490", width=3),
+                          marker=dict(size=4), name=league_name_b, hovertext=labels,
+                          hovertemplate="%{hovertext}<br>%{y} pts<extra></extra>")
+        fig2.update_layout(
+            height=320, margin=dict(l=0, r=0, t=10, b=0),
+            xaxis=dict(title="Scoring events (chronological)", showticklabels=False),
+            yaxis_title="Cumulative GW points",
+            legend=dict(orientation="h", y=1.12, x=0),
+        )
+        st.plotly_chart(fig2, width="stretch")
+
+        # ── Heavy differential callouts ─────────────────────────────────────────
+        st.markdown(f"###### 🌟 Heavy differentials this GW (swing ≥ {HEAVY_THRESHOLD} pts)")
+        if heavy:
+            for pid, v in sorted(heavy.items(), key=lambda kv: -abs(kv[1]["swing"])):
+                side  = league_name_a if v["swing"] > 0 else league_name_b
+                emoji = "🟢" if v["swing"] > 0 else "🔵"
+                st.write(f'{emoji} **{v["name"]}** has swung **{abs(v["swing"])} pts** toward **{side}** so far')
+        else:
+            st.caption("No single player has swung this GW by 10+ points yet — tight race.")
+
+        # ── Full chronological ticker ───────────────────────────────────────────
+        with st.expander("Full event-by-event ticker"):
+            df_evt = pd.DataFrame([{
+                "Fixture":  f'{e.get("home","?")} vs {e.get("away","?")}',
+                "Player":   e["name"],
+                "Stat":     engine.STAT_LABELS.get(e["stat"], e["stat"]),
+                "Pts":      e["raw_points"],
+                f"{league_name_a} x": e["count_a"],
+                f"{league_name_b} x": e["count_b"],
+                "Score after": f'{e["score_a_after"]} – {e["score_b_after"]}',
+            } for e in timeline])
+            st.dataframe(df_evt, hide_index=True, width="stretch", height=420)
+
+
+# ── Season Trend (past-gameweek analysis) ─────────────────────────────────────
+with tabs["Season Trend"]:
     N = 8
     show_gws = list(range(max(1, gw - N + 1), gw + 1))
 
@@ -367,7 +489,7 @@ with tabs["Points Race"]:
     cum_a = _cumulative(res["team_a_ids"], histories_a, cap_a_idx)
     cum_b = _cumulative(res["team_b_ids"], histories_b, cap_b_idx)
 
-    st.markdown(f"##### Cumulative points race — last {len(show_gws)} GWs")
+    st.markdown(f"##### Cumulative points — last {len(show_gws)} GWs")
     fig = go.Figure()
     fig.add_scatter(x=[f"GW{g}" for g in show_gws], y=cum_a, mode="lines+markers",
                      name=league_name_a, line=dict(color="#1a8754", width=3))
@@ -383,6 +505,12 @@ with tabs["Points Race"]:
         st.caption(f"{league_name_b} lead by {abs(lead)} pts over this window.")
     else:
         st.caption("Dead level over this window.")
+
+    if len(show_gws) < 2:
+        st.caption(
+            "Only one gameweek of history is available so far this season — "
+            "this chart fills out as more GWs are played."
+        )
 
 
 # ── Chip tracker ───────────────────────────────────────────────────────────────
