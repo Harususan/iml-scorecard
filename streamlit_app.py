@@ -33,6 +33,34 @@ CHIP_STYLE = {
     "active":    "background-color: #e0e7ff; color: #4338ca; font-weight: 700;",
 }
 
+# ── League registry ────────────────────────────────────────────────────────────
+# Each "team" here is a 4-manager classic mini-league named after its PL club.
+# Selecting a team in the sidebar resolves straight to its League ID and
+# manager roster — no need to type/paste IDs or guess a captain's name.
+TEAMS = {
+    "Arsenal":                 {"league_id": "767705",  "managers": ["Aayush Bermola", "Bilal Mahmood", "Saksham Mishra", "Tanish Bermola"]},
+    "Aston Villa":              {"league_id": "705859",  "managers": ["Agneebha Ghosh", "Subhajit Dutta", "Ishaan Goel", "Vinamra Dave"]},
+    "Bournemouth":              {"league_id": "729033",  "managers": ["Sarthak Grover", "Soumil Mendiratta", "Parameshwar Hembram", "Chandrashekhar Ramadoss"]},
+    "Brentford":                {"league_id": "705820",  "managers": ["Sannan Shah", "Sheikh Usmaan", "Amaan Seven", "Aflaq Shah"]},
+    "Brighton and Hove Albion": {"league_id": "906398",  "managers": ["Mukul Kundu", "Nishanth G Suseelan", "Shivam Pahuja", "Abhijeet Kundu"]},
+    "Chelsea":                  {"league_id": "1560363", "managers": ["Shashwat Prakash Dubey", "Amitash Srivastava", "Sourav Hemran", "Winayak Kumar"]},
+    "Coventry City":            {"league_id": "1388324", "managers": ["Sreejan Deb", "Sunny Das", "Debanjan Dutta", "Rohit Sengupta"]},
+    "Crystal Palace":           {"league_id": "944252",  "managers": ["Arish Mehta", "Aryaman Arora", "sidhanth muralidhar", "Farhan ul Haq"]},
+    "Everton":                  {"league_id": "706707",  "managers": ["Ayush Falor", "Dylan M", "Gau Mohanty", "Rizwan Azavedo"]},
+    "Fulham":                   {"league_id": "1169975", "managers": ["Sehaj Singh", "Piravinthan Susendralingam", "Jawad Ali", "Samarth Vishal Sood"]},
+    "Hull City":                {"league_id": "708601",  "managers": ["Vikhayat Arora", "Mehul Goyal", "Aayush Sahanan", "Animesh Vijayvargiya"]},
+    "Ipswich Town":             {"league_id": "1564554", "managers": ["Darshan Lakhani", "Bishpan Singh", "Badal Kumar", "Tushar Gupta"]},
+    "Leeds United":             {"league_id": "1546694", "managers": ["Rohan Biswas", "Bhagat Khatiwoda", "Aman Gupta", "Sayantan Mondal"]},
+    "Liverpool":                {"league_id": "1658463", "managers": ["Rudrabha Chakraborty", "Unmesh Gavand", "Mohan Arora", "Shashank n"]},
+    "Manchester City":          {"league_id": "972886",  "managers": ["Harsh Bhat", "Priyanshu Mukherjee", "Uday Chandak", "Nimish Sanghavi"]},
+    "Manchester United":        {"league_id": "1260458", "managers": ["Advaita Gupta", "Vasav Gupta", "Arudra Sen Gupta", "Raghav Datta"]},
+    "Newcastle United":         {"league_id": "1124106", "managers": ["Hussain Jawadwala", "Rithvik R", "Krutik Patel", "Dk Vudatha"]},
+    "Nottingham Forest":        {"league_id": "710305",  "managers": ["Anmol Gupta", "Avi Naik", "Abhishek Pedamkar", "Dibyendu Adhikary"]},
+    "Sunderland":               {"league_id": "1498809", "managers": ["Vaibhav Garg", "Naman Bhatia", "Gaurav Joshi", "Jai Gupta"]},
+    "Tottenham Hotspurs":       {"league_id": "1547761", "managers": ["Hitesh Kumar", "Ketan Virmani", "Akshay Soni", "Hriday Ranade"]},
+}
+TEAM_NAMES = sorted(TEAMS.keys())
+
 
 # ── Cached wrappers around the engine's network calls ────────────────────────
 # (kept separate from engine.py itself so the CLI script stays untouched)
@@ -70,6 +98,27 @@ def cached_team_picks(manager_ids, cap_index, gw, team_label, _player_map, manag
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_fixture_kickoffs(gw: int):
     return engine.get_fixture_kickoffs(gw)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_fixture_status(gw: int):
+    """club_id -> 'finished' | 'live' | 'upcoming', from the raw fixtures endpoint."""
+    try:
+        data = engine.fetch(f"{engine.BASE}/fixtures/?event={gw}")
+    except Exception:
+        return {}
+    status = {}
+    for f in data:
+        if f.get("finished"):
+            s = "finished"
+        elif f.get("started"):
+            s = "live"
+        else:
+            s = "upcoming"
+        for tid in (f.get("team_h"), f.get("team_a")):
+            if tid:
+                status[tid] = s
+    return status
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -139,10 +188,17 @@ def team_total(picks_list, cap_idx, live_scores):
 with st.sidebar:
     st.header("⚽ Match settings")
     gw = st.number_input("Gameweek", min_value=1, max_value=38, value=1, step=1)
-    league_a = st.text_input("League A ID", placeholder="e.g. 314")
-    league_b = st.text_input("League B ID", placeholder="e.g. 315")
-    cap_a = st.text_input("Team A H2H captain", placeholder="Manager name (partial OK)")
-    cap_b = st.text_input("Team B H2H captain", placeholder="Manager name (partial OK)")
+
+    team_a_name = st.selectbox("Team A", TEAM_NAMES, index=0)
+    cap_a = st.selectbox(f"{team_a_name} H2H captain", TEAMS[team_a_name]["managers"])
+
+    st.write("")
+    b_default = 1 if TEAM_NAMES[0] == team_a_name else 0
+    team_b_name = st.selectbox("Team B", TEAM_NAMES, index=b_default)
+    cap_b = st.selectbox(f"{team_b_name} H2H captain", TEAMS[team_b_name]["managers"])
+
+    league_a = TEAMS[team_a_name]["league_id"]
+    league_b = TEAMS[team_b_name]["league_id"]
 
     st.divider()
     no_live    = st.checkbox("Skip live scores", value=False,
@@ -153,31 +209,24 @@ with st.sidebar:
     st.divider()
     run_clicked = st.button("Run analysis", type="primary", width="stretch")
 
-    with st.expander("How to find a League ID"):
-        st.write(
-            "Open your classic league on the FPL site — the ID is the number "
-            "in the URL, e.g. `fantasy.premierleague.com/leagues/**314**/standings/c`."
-        )
-
 if "results" not in st.session_state:
     st.session_state.results = None
 if "settings" not in st.session_state:
     st.session_state.settings = None
 
 if run_clicked:
-    if not league_a.strip() or not league_b.strip() or not cap_a.strip() or not cap_b.strip():
-        st.error("Please fill in both league IDs and both H2H captain names.")
+    if team_a_name == team_b_name:
+        st.error("Team A and Team B must be different clubs.")
     else:
         try:
             with st.spinner("Talking to the FPL API — leagues, picks, chip history..."):
                 st.session_state.results = run_pipeline(
-                    int(gw), league_a.strip(), league_b.strip(),
-                    cap_a.strip(), cap_b.strip(), no_live,
+                    int(gw), league_a, league_b, cap_a, cap_b, no_live,
                 )
                 st.session_state.settings = dict(no_summary=no_summary, no_chips=no_chips)
             st.toast("Analysis complete!", icon="✅")
         except SystemExit as e:
-            st.error(str(e).strip() or "Couldn't resolve one of the captains — check the name and try again.")
+            st.error(str(e).strip() or "Couldn't resolve one of the captains — check the roster and try again.")
         except Exception as e:
             st.error(f"Something went wrong fetching data: {e}")
 
@@ -186,7 +235,7 @@ st.caption("Head-to-head ownership & point-swing analyser — 2026/27 season")
 
 res = st.session_state.results
 if res is None:
-    st.info("Fill in both league IDs and H2H captains in the sidebar, then click **Run analysis**.")
+    st.info("Pick both teams and their H2H captains in the sidebar, then click **Run analysis**.")
     st.stop()
 
 settings      = st.session_state.settings
@@ -299,25 +348,57 @@ with tabs["Team Totals"]:
 
 
 # ── Differential & swing ──────────────────────────────────────────────────────
+STATUS_LABEL = {"finished": "✅ FT", "live": "🔴 LIVE", "upcoming": "⏳ Upcoming", "unknown": "❔ —"}
+STATUS_ORDER = ["live", "upcoming", "finished", "unknown"]
+NAME_TO_TEAM_ID = {v: k for k, v in engine.CLUBS.items()}
+
 with tabs["Differential & Swing"]:
     st.markdown(f"##### Ownership differential & point swing — GW{gw}")
-    df_rows = pd.DataFrame(rows)[["name", "position", "club", "A", "B", "diff", "live_pts", "point_swing"]]
-    df_rows.columns = ["Player", "Pos", "Club", "A", "B", "Diff", "GW Pts", "Swing"]
 
-    def _swing_style(v):
-        if v > 0:
-            return "color: #1a8754; font-weight: 600"
-        if v < 0:
-            return "color: #c0392b; font-weight: 600"
-        return "color: #6b7280"
+    fixture_status = cached_fixture_status(gw)
+    for r in rows:
+        team_id = NAME_TO_TEAM_ID.get(r["club"])
+        r["_status"] = fixture_status.get(team_id, "unknown") if team_id else "unknown"
 
-    st.dataframe(
-        df_rows.style.map(_swing_style, subset=["Swing"]),
-        hide_index=True, width="stretch", height=420,
+    counts = {s: sum(1 for r in rows if r["_status"] == s) for s in STATUS_ORDER}
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🔴 Live", counts["live"])
+    c2.metric("⏳ Upcoming", counts["upcoming"])
+    c3.metric("✅ Finished", counts["finished"])
+    if counts["unknown"]:
+        c4.metric("❔ Unknown", counts["unknown"])
+
+    status_filter = st.radio(
+        "Filter by match status", ["All", "🔴 Live", "⏳ Upcoming", "✅ Finished"],
+        horizontal=True, label_visibility="collapsed",
     )
+    status_key = {"🔴 Live": "live", "⏳ Upcoming": "upcoming", "✅ Finished": "finished"}.get(status_filter)
+    filtered_rows = rows if status_key is None else [r for r in rows if r["_status"] == status_key]
+
+    if not filtered_rows:
+        st.caption("No players in this status right now.")
+    else:
+        df_rows = pd.DataFrame(filtered_rows)[
+            ["name", "position", "club", "_status", "A", "B", "diff", "live_pts", "point_swing"]
+        ]
+        df_rows.columns = ["Player", "Pos", "Club", "Status", "A", "B", "Diff", "GW Pts", "Swing"]
+        df_rows["Status"] = df_rows["Status"].map(STATUS_LABEL)
+
+        def _swing_style(v):
+            if v > 0:
+                return "color: #1a8754; font-weight: 600"
+            if v < 0:
+                return "color: #c0392b; font-weight: 600"
+            return "color: #6b7280"
+
+        st.dataframe(
+            df_rows.style.map(_swing_style, subset=["Swing"]),
+            hide_index=True, width="stretch", height=420,
+        )
     st.caption(
         "Count: H2H captain + FPL captain = x4 · either alone = x2 · normal = x1 · "
-        "Swing = diff × GW pts. Positive favours Team A, negative favours Team B."
+        "Swing = diff × GW pts. Positive favours Team A, negative favours Team B. "
+        "Status reflects each player's club fixture this gameweek."
     )
 
     swing_rows = [r for r in rows if r["point_swing"] != 0][:15]
