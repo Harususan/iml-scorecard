@@ -17,6 +17,9 @@ from firing here).
 import contextlib
 import io
 import json
+import math
+import itertools
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pandas as pd
@@ -165,51 +168,6 @@ def gw_matchups(gw: int):
 
 
 TEAM_TO_CLUB_ID = {v: k for k, v in CLUB_ID_TO_TEAM.items()}
-
-
-def find_next_gw(bootstrap: dict) -> int:
-    """First unplayed gameweek, per bootstrap's own 'is_next' flag."""
-    for ev in bootstrap.get("events", []):
-        if ev.get("is_next"):
-            return ev["id"]
-    for ev in bootstrap.get("events", []):
-        if not ev.get("finished"):
-            return ev["id"]
-    return 1
-
-
-def find_next_opponent(team_name: str, gw: int):
-    """Returns (opponent_team_name, is_home, fixture_dict) for `team_name`'s
-    real PL fixture in gw, or (None, None, None) if not found (blank GW etc.)."""
-    my_id = TEAM_TO_CLUB_ID.get(team_name)
-    if my_id is None:
-        return None, None, None
-    for f in cached_raw_fixtures(gw):
-        if f.get("team_h") == my_id:
-            return CLUB_ID_TO_TEAM.get(f.get("team_a")), True, f
-        if f.get("team_a") == my_id:
-            return CLUB_ID_TO_TEAM.get(f.get("team_h")), False, f
-    return None, None, None
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_ep_map(_bootstrap):
-    """element_id -> FPL's own 'expected points next fixture' (ep_next)."""
-    ep = {}
-    for el in _bootstrap.get("elements", []):
-        try:
-            ep[el["id"]] = float(el.get("ep_next") or 0)
-        except (TypeError, ValueError):
-            ep[el["id"]] = 0.0
-    return ep
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_history_squad_picks(manager_ids, gw, team_label, _player_map, managers):
-    """Same as cached_team_picks but with cap_index=-1 (no H2H captain) — used
-    in planner mode where the H2H captain for a future GW hasn't been chosen
-    yet, so nobody's ownership count should be artificially doubled."""
-    return engine.fetch_team_picks(manager_ids, -1, gw, team_label, _player_map, managers)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -791,211 +749,987 @@ def render_weekly_matchups(gw: int, no_live: bool, no_summary: bool, no_chips: b
             render_fixture(matchup, gw, no_live, no_summary, no_chips)
 
 
-# ── Next-GW Planner mode: squad differential preview + captain/chip sim ──────
-# def _projected_score(mgr: dict, player_map: dict, ep_map: dict, cap_name: str, chip: str) -> float:
-#     starters = [p for p in mgr["picks"] if p["position"] <= 11]
-#     bench    = [p for p in mgr["picks"] if p["position"] > 11]
-#     pool = starters + bench if chip == "Bench Boost" else starters
-#     total = 0.0
-#     for p in pool:
-#         pl   = player_map.get(p["element"], {})
-#         xp   = ep_map.get(p["element"], 0.0)
-#         mult = 1
-#         if pl.get("name") == cap_name:
-#             mult = 3 if chip == "Triple Captain" else 2
-#         total += xp * mult
-#     return round(total, 1)
+
+# ── League-wide analytics engine ────────────────────────────────────────────────
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_iml_registry():
+    """Return the 80 IML members grouped by their 20 club-named H2H teams."""
+    out = []
+    for team_name, cfg in TEAMS.items():
+        managers = cached_league_managers(cfg["league_id"])
+        for m in managers:
+            out.append({
+                "team": team_name,
+                "league_id": cfg["league_id"],
+                "manager_id": str(m["id"]),
+                "manager": m.get("manager") or m.get("name") or str(m["id"]),
+            })
+    # De-duplicate defensively in case a manager appears in two registered leagues.
+    seen = set()
+    deduped = []
+    for row in out:
+        if row["manager_id"] not in seen:
+            seen.add(row["manager_id"])
+            deduped.append(row)
+    return tuple(deduped)
 
 
-# def render_planner_mode() -> None:
-#     st.subheader("🔭 Next-GW Planner")
-#     st.caption(
-#         "Preview your squad against your next opponent before the deadline, and try "
-#         "different captain/chip choices to shape your plan."
-#     )
-
-#     your_team = st.selectbox("Your team", TEAM_NAMES, key="planner_team")
-
-#     bootstrap  = cached_bootstrap()
-#     player_map = cached_player_map(bootstrap)
-#     ep_map     = cached_ep_map(bootstrap)
-#     next_gw    = find_next_gw(bootstrap)
-
-#     try:
-#         opp_team, is_home, fixture = find_next_opponent(your_team, next_gw)
-#     except Exception as e:
-#         st.error(f"Couldn't load GW{next_gw} fixtures: {e}")
-#         return
-
-#     if not opp_team:
-#         st.warning(f"Couldn't find a GW{next_gw} fixture for {your_team} yet — could be a blank gameweek.")
-#         return
-
-#     venue = "🏠 Home" if is_home else "✈️ Away"
-#     ko = fixture.get("kickoff_time") or ""
-#     ko_display = f"{ko[:10]} {ko[11:16]} UTC" if len(ko) >= 16 else "Kickoff TBC"
-#     st.info(f"**GW{next_gw}: {your_team} vs {opp_team}**  ·  {venue}  ·  {ko_display}")
-
-#     try:
-#         with st.spinner(f"Loading GW{next_gw} squads..."):
-#             managers_you = cached_league_managers(TEAMS[your_team]["league_id"])
-#             managers_opp = cached_league_managers(TEAMS[opp_team]["league_id"])
-#             ids_you = [m["id"] for m in managers_you]
-#             ids_opp = [m["id"] for m in managers_opp]
-#             picks_you = cached_history_squad_picks(ids_you, next_gw, "A", player_map, managers_you)
-#             picks_opp = cached_history_squad_picks(ids_opp, next_gw, "B", player_map, managers_opp)
-#     except Exception as e:
-#         st.warning(
-#             f"Squads for GW{next_gw} aren't available yet ({e}). "
-#             "They usually appear once the previous gameweek locks in."
-#         )
-#         return
-
-#     rows = engine.build_differential(picks_you, picks_opp, player_map, {})
-#     for r in rows:
-#         r["ep_next"]    = ep_map.get(r["id"], 0.0)
-#         r["proj_swing"] = round(r["diff"] * r["ep_next"], 1)
-#     rows.sort(key=lambda r: -abs(r["proj_swing"]))
-
-#     st.markdown("##### Squad differential preview")
-#     if rows:
-#         df = pd.DataFrame(rows)[["name", "position", "club", "A", "B", "diff", "ep_next", "proj_swing"]]
-#         df.columns = ["Player", "Pos", "Club", "You", "Opponent", "Diff", "xPts (next)", "Proj. swing"]
-
-#         def _swing_style(v):
-#             if v > 0:
-#                 return "color: #1a8754; font-weight: 600"
-#             if v < 0:
-#                 return "color: #c0392b; font-weight: 600"
-#             return "color: #6b7280"
-
-#         st.dataframe(
-#             df.style.map(_swing_style, subset=["Proj. swing"]),
-#             hide_index=True, width="stretch", height=380,
-#         )
-#     st.caption(
-#         "xPts is FPL's own \u2018expected points, next fixture\u2019 model. Proj. swing = diff \u00d7 xPts — "
-#         "a planning estimate, not a live score (this match hasn't been played)."
-#     )
-
-#     st.divider()
-#     st.markdown("##### 🎯 Captain & chip simulator")
-#     st.caption("Pick one of your own managers and try a different captain or chip to see the projected impact.")
-
-#     your_managers = TEAMS[your_team]["managers"]
-#     sim_name = st.selectbox("Simulate as", your_managers, key="planner_manager")
-#     sim_idx  = your_managers.index(sim_name)
-#     sim_mgr  = picks_you[sim_idx]
-
-#     starters = [p for p in sim_mgr["picks"] if p["position"] <= 11]
-#     starter_names = [player_map.get(p["element"], {}).get("name", f'#{p["element"]}') for p in starters]
-#     current_cap_id   = next((p["element"] for p in sim_mgr["picks"] if p["is_captain"]), None)
-#     current_cap_name = player_map.get(current_cap_id, {}).get("name", starter_names[0] if starter_names else "—")
-
-#     c1, c2 = st.columns(2)
-#     default_idx = starter_names.index(current_cap_name) if current_cap_name in starter_names else 0
-#     cap_choice  = c1.selectbox("Captain", starter_names, index=default_idx, key="planner_cap")
-#     chip_choice = c2.selectbox("Chip", ["None", "Triple Captain", "Bench Boost"], key="planner_chip")
-
-#     current_projected = _projected_score(sim_mgr, player_map, ep_map, current_cap_name, "None")
-#     sim_projected      = _projected_score(sim_mgr, player_map, ep_map, cap_choice, chip_choice)
-#     delta = round(sim_projected - current_projected, 1)
-
-#     m1, m2 = st.columns(2)
-#     m1.metric("Current plan", f"{current_projected} xPts", help=f"Captain: {current_cap_name}, no chip")
-#     m2.metric("Your simulation", f"{sim_projected} xPts", delta=f"{delta:+.1f}")
-
-#     other_total_current = sum(
-#         _projected_score(
-#             mgr, player_map, ep_map,
-#             player_map.get(next((p["element"] for p in mgr["picks"] if p["is_captain"]), None), {}).get("name", ""),
-#             "None",
-#         )
-#         for i, mgr in enumerate(picks_you) if i != sim_idx
-#     )
-#     your_team_current = other_total_current + current_projected
-#     your_team_sim      = other_total_current + sim_projected
-
-#     opp_total = sum(
-#         _projected_score(
-#             mgr, player_map, ep_map,
-#             player_map.get(next((p["element"] for p in mgr["picks"] if p["is_captain"]), None), {}).get("name", ""),
-#             "None",
-#         )
-#         for mgr in picks_opp
-#     )
-
-#     st.write("")
-#     st.markdown("###### Projected team totals (all 4 managers, no H2H captain assigned yet)")
-#     t1, t2, t3 = st.columns(3)
-#     t1.metric(f"{your_team} (current plan)", f"{your_team_current:.1f} xPts")
-#     t2.metric(f"{your_team} (with your simulation)", f"{your_team_sim:.1f} xPts",
-#               delta=f"{(your_team_sim - your_team_current):+.1f}")
-#     t3.metric(f"{opp_team}", f"{opp_total:.1f} xPts")
-
-#     margin = your_team_sim - opp_total
-#     if margin > 0:
-#         st.success(f"Projected: **{your_team}** ahead of **{opp_team}** by **{margin:.1f} xPts** with this plan.")
-#     elif margin < 0:
-#         st.error(f"Projected: **{opp_team}** ahead of **{your_team}** by **{abs(margin):.1f} xPts** with this plan.")
-#     else:
-#         st.info("Projected: dead level with this plan.")
-
-#     st.caption(
-#         "This is a planning estimate only — Wildcard/Free Hit aren't simulated here since they "
-#         "change your whole squad, not just a scoring multiplier."
-#     )
+@st.cache_data(ttl=180, show_spinner=False)
+def cached_all_current_picks(gw: int, manager_ids: tuple):
+    """Fetch current-gameweek picks for all IML managers."""
+    out = {}
+    for mid in manager_ids:
+        try:
+            out[mid] = engine.get_picks(mid, gw)
+        except Exception:
+            out[mid] = {}
+    return out
 
 
-# ── Sidebar: global settings ───────────────────────────────────────────────────
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_player_summaries(player_ids: tuple):
+    """Fetch element-summary histories for the supplied player IDs."""
+    out = {}
+    for pid in player_ids:
+        try:
+            out[int(pid)] = engine.fetch(f"{engine.BASE}/element-summary/{int(pid)}/")
+        except Exception:
+            out[int(pid)] = {}
+    return out
 
-# Streamlit only keeps a widget's session_state value alive while that widget
-# is actually instantiated on every run. Since the Gameweek/skip-* controls
-# only render in "This Week's Matchups" mode, we mirror them into plain
-# (non-widget) session_state keys that survive switching to Planner mode
-# and back.
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_fixtures_all():
+    """Fetch the full fixture list once; analytics uses it for tickers and projections."""
+    try:
+        return engine.fetch(f"{engine.BASE}/fixtures/")
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_all_manager_histories(manager_ids: tuple):
+    return engine.get_all_season_histories(list(manager_ids))
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_manager_transfers(manager_id: str):
+    try:
+        return engine.fetch(f"{engine.BASE}/entry/{manager_id}/transfers/")
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_manager_gw_picks(manager_id: str, gw: int):
+    try:
+        return engine.get_picks(manager_id, gw)
+    except Exception:
+        return {}
+
+
+def current_or_next_gw(bootstrap: dict) -> int:
+    for ev in bootstrap.get("events", []):
+        if ev.get("is_current"):
+            return int(ev["id"])
+    for ev in bootstrap.get("events", []):
+        if ev.get("is_next"):
+            return int(ev["id"])
+    for ev in bootstrap.get("events", []):
+        if not ev.get("finished"):
+            return int(ev["id"])
+    return 1
+
+
+def _safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _pct_rank(values):
+    """Simple percentile rank, robust to a short league at season start."""
+    if not values:
+        return {}
+    ordered = sorted(values)
+    n = len(ordered)
+    return {
+        v: (sum(x <= v for x in ordered) - 1) / max(1, n - 1)
+        for v in set(values)
+    }
+
+
+def _normalize01(v, lo, hi):
+    if hi <= lo:
+        return 0.5
+    return max(0.0, min(1.0, (v - lo) / (hi - lo)))
+
+
+def _difficulty_factor(fdr):
+    # FPL FDR is 1 (best) → 5 (worst). 3 is the neutral baseline.
+    return {1: 1.16, 2: 1.08, 3: 1.00, 4: 0.92, 5: 0.84}.get(int(fdr or 3), 1.0)
+
+
+def _defcon_threshold(position):
+    return {"DEF": 10, "MID": 12, "FWD": 12}.get(position, 999)
+
+
+def _player_position_map(bootstrap):
+    return {int(e["id"]): engine.POSITIONS.get(e.get("element_type"), "?")
+            for e in bootstrap.get("elements", [])}
+
+
+def _team_name_map(bootstrap):
+    return {int(t["id"]): t.get("name") or str(t["id"]) for t in bootstrap.get("teams", [])}
+
+
+def _fixture_index(fixtures):
+    idx = defaultdict(list)
+    for f in fixtures:
+        event = f.get("event")
+        if not event:
+            continue
+        h = int(f.get("team_h") or 0)
+        a = int(f.get("team_a") or 0)
+        if h:
+            idx[h].append({
+                "event": int(event), "opponent_id": a, "home": True,
+                "kickoff": f.get("kickoff_time") or "",
+                "fdr": int(f.get("team_h_difficulty") or 3),
+                "fixture_id": f.get("id"),
+                "started": bool(f.get("started")),
+                "finished": bool(f.get("finished") or f.get("finished_provisional")),
+            })
+        if a:
+            idx[a].append({
+                "event": int(event), "opponent_id": h, "home": False,
+                "kickoff": f.get("kickoff_time") or "",
+                "fdr": int(f.get("team_a_difficulty") or 3),
+                "fixture_id": f.get("id"),
+                "started": bool(f.get("started")),
+                "finished": bool(f.get("finished") or f.get("finished_provisional")),
+            })
+    for k in idx:
+        idx[k].sort(key=lambda x: (x["event"], x["kickoff"]))
+    return idx
+
+
+def build_player_analytics(bootstrap, fixtures, player_summaries=None, horizon=5, start_gw=None):
+    """
+    Transparent projection model:
+      1) Minutes security: start rate + average minutes.
+      2) Underlying: xG90 + xA90 + DC90.
+      3) Recent form: recent FPL points adjusted by fixture difficulty.
+      4) Next-fixture multiplier from official FPL FDR.
+      5) Projected points = blended season/recent baseline × minutes security × FDR.
+    """
+    player_summaries = player_summaries or {}
+    teams = _team_name_map(bootstrap)
+    fx_idx = _fixture_index(fixtures)
+    current_gw = int(start_gw or current_or_next_gw(bootstrap))
+    rows = []
+
+    for p in bootstrap.get("elements", []):
+        pid = int(p["id"])
+        pos = engine.POSITIONS.get(p.get("element_type"), "?")
+        hist = (player_summaries.get(pid) or {}).get("history", [])
+
+        # Use recent player history when available; bootstrap remains the fallback.
+        recent = sorted(hist, key=lambda h: int(h.get("round") or 0))[-5:]
+        played = [h for h in recent if _safe_float(h.get("minutes")) > 0]
+        minutes_total = sum(_safe_float(h.get("minutes")) for h in hist)
+        starts_total = sum(_safe_float(h.get("starts")) for h in hist)
+        appearances = len([h for h in hist if _safe_float(h.get("minutes")) > 0])
+
+        avg_minutes = (minutes_total / appearances) if appearances else _safe_float(p.get("minutes"), 0) / max(1, _safe_float(p.get("games_played"), 1))
+        start_rate = (starts_total / max(1, appearances)) if hist else 0.75 if _safe_float(p.get("minutes")) >= 60 else 0.4
+        minutes_security = max(0.0, min(1.0, 0.58 * min(avg_minutes / 90.0, 1.0) + 0.42 * min(start_rate, 1.0)))
+
+        xg = sum(_safe_float(h.get("expected_goals")) for h in hist)
+        xa = sum(_safe_float(h.get("expected_assists")) for h in hist)
+        mins = max(1.0, minutes_total)
+        xg90 = 90.0 * xg / mins
+        xa90 = 90.0 * xa / mins
+        xgi90 = xg90 + xa90
+
+        dc_total = sum(_safe_float(h.get("defensive_contribution")) for h in hist)
+        dc90 = 90.0 * dc_total / mins if dc_total else 0.0
+        threshold = _defcon_threshold(pos)
+        defcon_hits = [h for h in played if _safe_float(h.get("defensive_contribution")) >= threshold]
+        defcon_reliability = len(defcon_hits) / len(played) if played else 0.0
+
+        # Bootstrap fallback for early season / players without detailed history.
+        season_ppg = _safe_float(p.get("points_per_game"), 0.0)
+        season_form = _safe_float(p.get("form"), season_ppg)
+        if played:
+            recent_ppg = sum(_safe_float(h.get("total_points")) for h in played) / len(played)
+        else:
+            recent_ppg = season_form
+
+        # Fixture-adjusted recent form: punish hard recent schedules, reward easy ones.
+        recent_adj = []
+        for h in played:
+            fdr = 3
+            for f in fx_idx.get(int(p.get("team") or 0), []):
+                if int(f["event"]) == int(h.get("round") or -1):
+                    fdr = f["fdr"]
+                    break
+            recent_adj.append(_safe_float(h.get("total_points")) * _difficulty_factor(fdr))
+        fixture_adjusted_form = sum(recent_adj) / len(recent_adj) if recent_adj else season_form
+
+        # Forward fixture ticker.
+        fixtures_next = [
+            f for f in fx_idx.get(int(p.get("team") or 0), [])
+            if f["event"] >= current_gw and not f["finished"]
+        ][:horizon]
+
+        proj = []
+        for f in fixtures_next:
+            fixture_baseline = (
+                0.55 * season_ppg +
+                0.25 * recent_ppg +
+                0.20 * fixture_adjusted_form
+            )
+            underlying_signal = 1.55 * xgi90 + (0.10 * dc90)
+            minutes_factor = 0.62 + 0.38 * minutes_security
+            match_projection = (fixture_baseline + underlying_signal) * minutes_factor * _difficulty_factor(f["fdr"])
+            # Small role correction for goalkeepers/defenders through clean sheets/defcon.
+            if pos in ("GKP", "DEF"):
+                match_projection += 0.18 * defcon_reliability
+            proj.append(match_projection)
+
+        projected_next = sum(proj)
+        next_ppg = projected_next / len(proj) if proj else max(0.0, season_ppg)
+
+        # Simple reliability blend, constrained to an intuitive 0-100 score.
+        ppg_stability = 1.0
+        if len(played) >= 2:
+            vals = [_safe_float(h.get("total_points")) for h in played]
+            mean = sum(vals) / len(vals)
+            stdev = (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5
+            ppg_stability = 1.0 / (1.0 + (stdev / max(1.0, mean)))
+        reliability = 100.0 * (0.58 * minutes_security + 0.24 * defcon_reliability + 0.18 * ppg_stability)
+
+        rows.append({
+            "id": pid,
+            "name": p.get("web_name") or f"#{pid}",
+            "full_name": f'{p.get("first_name","")} {p.get("second_name","")}'.strip(),
+            "position": pos,
+            "club": teams.get(int(p.get("team") or 0), "?"),
+            "club_id": int(p.get("team") or 0),
+            "price": _safe_float(p.get("now_cost")) / 10.0,
+            "ownership": _safe_float(p.get("selected_by_percent")),
+            "season_points": _safe_float(p.get("total_points")),
+            "season_ppg": season_ppg,
+            "form": season_form,
+            "minutes": _safe_float(p.get("minutes")),
+            "minutes_security": minutes_security * 100.0,
+            "xg90": xg90,
+            "xa90": xa90,
+            "xgi90": xgi90,
+            "dc90": dc90,
+            "defcon_reliability": defcon_reliability * 100.0,
+            "fixture_adjusted_form": fixture_adjusted_form,
+            "projected_next": projected_next,
+            "projected_ppg": next_ppg,
+            "reliability": reliability,
+            "fixtures_next": fixtures_next,
+        })
+    return rows
+
+
+def _squad_player_ids(all_picks):
+    ids = set()
+    for data in all_picks.values():
+        for p in data.get("picks", []) if data else []:
+            try:
+                ids.add(int(p["element"]))
+            except Exception:
+                pass
+    return tuple(sorted(ids))
+
+
+def league_ownership_table(registry, all_picks, analytics_rows):
+    analytics_map = {r["id"]: r for r in analytics_rows}
+    owners = defaultdict(set)
+    captainters = defaultdict(float)
+    team_counts = defaultdict(lambda: defaultdict(int))
+
+    for member in registry:
+        mid = member["manager_id"]
+        data = all_picks.get(mid) or {}
+        for p in data.get("picks", []):
+            pid = int(p["element"])
+            owners[pid].add(mid)
+            if p.get("position", 0) <= 11:
+                team_counts[member["team"]][pid] += 1
+                if p.get("is_captain"):
+                    # Captain ownership counts as one extra unit; TC gets two extra.
+                    mult = 2 if data.get("active_chip") == "3xc" else 1
+                    captainters[pid] += mult
+
+    n = max(1, len(registry))
+    rows = []
+    for pid, owner_set in owners.items():
+        r = analytics_map.get(pid)
+        if not r:
+            continue
+        ownership_pct = 100.0 * len(owner_set) / n
+        eo_pct = 100.0 * (len(owner_set) + captainters.get(pid, 0)) / n
+        team_vals = [team_counts[t].get(pid, 0) for t in TEAMS.keys()]
+        max_diff = max(team_vals) - min(team_vals) if team_vals else 0
+        rows.append({
+            **r,
+            "iml_owned": len(owner_set),
+            "ownership_pct": ownership_pct,
+            "captain_pct": 100.0 * captainters.get(pid, 0) / n,
+            "effective_ownership_pct": eo_pct,
+            "max_team_ownership_diff": max_diff,
+            "swing_potential": max_diff * r["projected_ppg"],
+        })
+    rows.sort(key=lambda x: (-x["ownership_pct"], -x["projected_next"]))
+    return rows, team_counts
+
+
+def build_iml11(ownership_rows, ownership_threshold=20.0):
+    eligible = [r for r in ownership_rows if r["ownership_pct"] >= ownership_threshold]
+    if not eligible:
+        return []
+
+    # IML Template XI score: ownership is the floor (protect rank),
+    # projection is the upside, and security/reliability stop fragile picks winning.
+    for r in eligible:
+        r["iml11_score"] = (
+            0.30 * min(100.0, r["ownership_pct"]) +
+            0.28 * min(100.0, 20.0 * r["projected_ppg"]) +
+            0.15 * r["minutes_security"] +
+            0.12 * min(100.0, r["fixture_adjusted_form"] * 10.0) +
+            0.10 * r["defcon_reliability"] +
+            0.05 * r["reliability"]
+        )
+
+    # Greedy construction with FPL formation + max-three-per-club constraints.
+    selected = []
+    counts = defaultdict(int)
+
+    def pick_best(position=None, minimum=False):
+        cand = [x for x in eligible if (position is None or x["position"] == position)
+                and x["id"] not in {s["id"] for s in selected}
+                and counts[x["club_id"]] < 3]
+        cand.sort(key=lambda x: x["iml11_score"], reverse=True)
+        if not cand:
+            return None
+        x = cand[0]
+        selected.append(x)
+        counts[x["club_id"]] += 1
+        return x
+
+    pick_best("GKP")
+    for _ in range(3):
+        pick_best("DEF")
+    for _ in range(2):
+        pick_best("MID")
+    pick_best("FWD")
+
+    while len(selected) < 11:
+        # Respect 5 defenders max, 5 mids max, 3 forwards max.
+        pos_counts = {p: sum(1 for s in selected if s["position"] == p) for p in ("DEF", "MID", "FWD", "GKP")}
+        cand = [x for x in eligible
+                if x["id"] not in {s["id"] for s in selected}
+                and counts[x["club_id"]] < 3
+                and (
+                    x["position"] == "DEF" and pos_counts["DEF"] < 5 or
+                    x["position"] == "MID" and pos_counts["MID"] < 5 or
+                    x["position"] == "FWD" and pos_counts["FWD"] < 3
+                )]
+        if not cand:
+            break
+        cand.sort(key=lambda x: x["iml11_score"], reverse=True)
+        x = cand[0]
+        selected.append(x)
+        counts[x["club_id"]] += 1
+
+    return selected[:11]
+
+
+def h2h_live_win_probability(picks_a, picks_b, player_map, live_scores, analytics_map,
+                             manager_histories=None, simulations=1800):
+    """
+    Monte Carlo forecast of a live H2H race.
+    Locked/live points are fixed; only players whose fixtures are not finished
+    receive a stochastic remainder based on projected points and reliability.
+    """
+    def starter_map(picks):
+        out = defaultdict(int)
+        for mgr in picks:
+            chip = mgr.get("active_chip")
+            for p in mgr.get("picks", []):
+                if chip == "bboost" or p.get("position", 0) <= 11:
+                    out[p["element"]] += p.get("count", 1)
+        return out
+
+    ca = starter_map(picks_a)
+    cb = starter_map(picks_b)
+    ids = set(ca) | set(cb)
+
+    fixed_a = sum(ca[pid] * live_scores.get(pid, 0) for pid in ids)
+    fixed_b = sum(cb[pid] * live_scores.get(pid, 0) for pid in ids)
+
+    future = []
+    for pid in ids:
+        r = analytics_map.get(pid)
+        if not r:
+            continue
+        # Current live score is locked; projected remainder is the difference
+        # between next-GW projection and already scored points, floored at zero.
+        rem_mean = max(0.0, r.get("projected_ppg", 0.0) - live_scores.get(pid, 0))
+        if rem_mean <= 0:
+            continue
+        reliability = max(0.15, min(0.92, r.get("reliability", 50.0) / 100.0))
+        future.append((pid, ca.get(pid, 0), cb.get(pid, 0), rem_mean, reliability))
+
+    # Deterministic seed from the current live state gives stable UI values within a run.
+    import random
+    seed = int(sum((pid + 1) * (live_scores.get(pid, 0) + 7) for pid in ids)) % (2**32 - 1)
+    rng = random.Random(seed)
+    wins_a = wins_b = draws = 0
+    for _ in range(simulations):
+        sa, sb = fixed_a, fixed_b
+        for pid, wa, wb, mean, rel in future:
+            # Gamma-like positive distribution, concentrated around mean.
+            shape = max(1.2, 1.5 + 3.0 * rel)
+            scale = mean / shape
+            sample = rng.gammavariate(shape, scale)
+            sa += wa * sample
+            sb += wb * sample
+        if sa > sb:
+            wins_a += 1
+        elif sb > sa:
+            wins_b += 1
+        else:
+            draws += 1
+    denom = max(1, simulations)
+    return (100.0 * wins_a / denom, 100.0 * draws / denom, 100.0 * wins_b / denom, future)
+
+
+def simulate_manager_score(mgr_picks, gw, player_histories, player_map):
+    """Return raw GW score and simple bench/captain regret quantities."""
+    picks = mgr_picks.get("picks", [])
+    active_chip = mgr_picks.get("active_chip")
+    by_id = {int(p["element"]): p for p in picks}
+
+    def stat(pid):
+        hist = (player_histories.get(pid) or {}).get("history", [])
+        for h in hist:
+            if int(h.get("round") or -1) == int(gw):
+                return h
+        return {}
+
+    # Actual effective captain.
+    actual_cap = next((p for p in picks if p.get("is_captain")), None)
+    vice = next((p for p in picks if p.get("is_vice_captain")), None)
+    if actual_cap and _safe_float(stat(int(actual_cap["element"])).get("minutes")) == 0 and active_chip != "bboost" and vice:
+        actual_cap = vice
+    cap_pid = int(actual_cap["element"]) if actual_cap else None
+    cap_mult = 3 if active_chip == "3xc" else 2
+
+    starters = [p for p in picks if p.get("position", 0) <= 11]
+    bench = [p for p in picks if p.get("position", 0) > 11]
+    raw = 0.0
+    for p in starters:
+        raw += _safe_float(stat(int(p["element"])).get("total_points"))
+    if cap_pid:
+        raw += _safe_float(stat(cap_pid).get("total_points")) * (cap_mult - 1)
+    if active_chip == "bboost":
+        raw += sum(_safe_float(stat(int(p["element"])).get("total_points")) for p in bench)
+
+    starter_pts = {int(p["element"]): _safe_float(stat(int(p["element"])).get("total_points")) for p in starters}
+    best_cap = max(starter_pts.values()) if starter_pts else 0.0
+    actual_cap_pts = starter_pts.get(cap_pid, 0.0)
+    captain_regret = max(0.0, (best_cap - actual_cap_pts) * cap_mult)
+
+    # Bench waste = bench points that were not consumed by a no-minutes auto-sub.
+    bench_points = [_safe_float(stat(int(p["element"])).get("total_points")) for p in bench]
+    bench_waste = sum(bench_points)
+    if active_chip != "bboost":
+        # Approximate auto-sub consumption: every zero-minute starter can consume the
+        # first eligible bench player while maintaining 1 GK / 3 DEF / 2 MID+FWD.
+        remaining_bench = list(bench)
+        for sp in starters:
+            if _safe_float(stat(int(sp["element"])).get("minutes")) > 0:
+                continue
+            for bp in list(remaining_bench):
+                bpos = int(by_id.get(int(bp["element"]), {}).get("position", 0))
+                spos = int(sp.get("position", 0))
+                # Basic FPL positional legality check.
+                starter_defs = sum(1 for x in starters if int(x.get("position", 0)) == 2 and x is not sp)
+                starter_gk = sum(1 for x in starters if int(x.get("position", 0)) == 1 and x is not sp)
+                # GK can only replace GK; outfield bench cannot be GK.
+                legal = (spos == 1 and bpos == 1) or (
+                    spos != 1 and bpos != 1 and
+                    starter_defs + (1 if bpos == 2 else 0) >= 3 and
+                    (starter_gk + 1) >= 1
+                )
+                if legal and _safe_float(stat(int(bp["element"])).get("minutes")) > 0:
+                    bench_waste -= _safe_float(stat(int(bp["element"])).get("total_points"))
+                    remaining_bench.remove(bp)
+                    break
+
+    return raw, max(0.0, bench_waste), captain_regret
+
+
+def manager_transfer_roi(manager_id, transfers, player_histories, window=4):
+    """4-GW transfer ROI: incoming points minus outgoing points over next N GWs, less hit."""
+    rows = []
+    for t in transfers or []:
+        try:
+            gw = int(t.get("event"))
+            inn = int(t.get("element_in"))
+            out = int(t.get("element_out"))
+        except Exception:
+            continue
+        h_in = (player_histories.get(inn) or {}).get("history", [])
+        h_out = (player_histories.get(out) or {}).get("history", [])
+        end = gw + window - 1
+        in_pts = sum(_safe_float(h.get("total_points")) for h in h_in if gw <= int(h.get("round") or -1) <= end)
+        out_pts = sum(_safe_float(h.get("total_points")) for h in h_out if gw <= int(h.get("round") or -1) <= end)
+        cost = abs(_safe_float(t.get("cost"), 0.0))
+        rows.append({
+            "gw": gw, "incoming": inn, "outgoing": out,
+            "incoming_pts": in_pts, "outgoing_pts": out_pts,
+            "hit": cost, "roi": in_pts - out_pts - cost,
+        })
+    return rows
+
+
+def manager_power_rankings(registry, histories, chip_histories):
+    records = []
+    for member in registry:
+        mid = member["manager_id"]
+        h = histories.get(mid, {})
+        gws = [v for g, v in sorted(h.get("gw_scores", {}).items()) if v.get("points") is not None]
+        pts = [float(v.get("points") or 0) for v in gws]
+        total = float(gws[-1].get("total_points") or 0) if gws else 0.0
+        recent = pts[-5:] if pts else []
+        mean = sum(pts) / len(pts) if pts else 0.0
+        stdev = (sum((x - mean) ** 2 for x in pts) / len(pts)) ** 0.5 if pts else 0.0
+        consistency = 100.0 / (1.0 + stdev / max(1.0, mean))
+        recent_mean = sum(recent) / len(recent) if recent else mean
+
+        chips = chip_histories.get(mid, [])
+        chip_events = [int(c["event"]) for c in chips]
+        chip_roi = 0.0
+        if chips and pts:
+            all_gw_nums = sorted(h.get("gw_scores", {}).keys())
+            nonchip = [
+                float(h.get("gw_scores", {}).get(g, {}).get("points", 0) or 0)
+                for g in all_gw_nums
+                if int(g) not in chip_events
+            ]
+            baseline = sum(nonchip) / len(nonchip) if nonchip else mean
+            chip_pts = sum(
+                h.get("gw_scores", {}).get(g, {}).get("points", 0) or 0
+                for g in chip_events
+            )
+            chip_roi = chip_pts / len(chips) - baseline
+
+        records.append({
+            **member,
+            "total_points": total,
+            "recent_mean": recent_mean,
+            "consistency": consistency,
+            "chip_roi": chip_roi,
+            "weeks": len(pts),
+        })
+
+    if not records:
+        return []
+
+    p_total = _pct_rank([r["total_points"] for r in records])
+    p_recent = _pct_rank([r["recent_mean"] for r in records])
+    p_cons = _pct_rank([r["consistency"] for r in records])
+    p_chip = _pct_rank([r["chip_roi"] for r in records])
+
+    for r in records:
+        r["power_score"] = 100.0 * (
+            0.50 * p_total[r["total_points"]] +
+            0.25 * p_recent[r["recent_mean"]] +
+            0.20 * p_cons[r["consistency"]] +
+            0.05 * p_chip[r["chip_roi"]]
+        )
+    records.sort(key=lambda x: (-x["power_score"], -x["total_points"]))
+    for i, r in enumerate(records, 1):
+        r["rank"] = i
+    return records
+
+
+def differential_finder(ownership_rows, min_ownership=2.5):
+    """Low-owned player shortlist using projection, reliability, fixture and crowd leverage."""
+    rows = []
+    for r in ownership_rows:
+        own = r["ownership_pct"]
+        if own > min_ownership + 7.5:
+            continue
+        upside = 0.55 * r["projected_ppg"] + 0.20 * r["fixture_adjusted_form"] + 0.15 * r["reliability"] / 20.0 + 0.10 * r["minutes_security"] / 20.0
+        leverage = max(0.0, 100.0 - own) / 100.0
+        score = upside * (0.65 + 0.35 * leverage)
+        rows.append({**r, "differential_score": score})
+    rows.sort(key=lambda x: (-x["differential_score"], -x["projected_ppg"]))
+    return rows[:30]
+
+
+def member_snapshot(manager_id, gw, player_histories, player_map):
+    """Historical manager lab: captain regret, bench waste, consistency and season totals."""
+    weekly = []
+    for g in range(1, gw + 1):
+        picks = cached_manager_gw_picks(manager_id, g)
+        if not picks or not picks.get("picks"):
+            continue
+        raw, bench_waste, cap_regret = simulate_manager_score(
+            picks, g, player_histories, player_map
+        )
+        weekly.append({"GW": g, "Points": raw, "Bench Wasted": bench_waste, "Captain Regret": cap_regret})
+
+    pts = [x["Points"] for x in weekly]
+    mean = sum(pts) / len(pts) if pts else 0.0
+    sd = (sum((x - mean) ** 2 for x in pts) / len(pts)) ** 0.5 if pts else 0.0
+    consistency = 100.0 / (1.0 + sd / max(1.0, mean))
+    return {
+        "weekly": weekly,
+        "avg_gw": mean,
+        "consistency": consistency,
+        "bench_wasted": sum(x["Bench Wasted"] for x in weekly),
+        "captain_regret": sum(x["Captain Regret"] for x in weekly),
+    }
+
+
+def format_fixture_ticker(row, team_map):
+    ticker = []
+    for f in row.get("fixtures_next", []):
+        opp = team_map.get(f["opponent_id"], str(f["opponent_id"]))
+        ticker.append({
+            "GW": f["event"],
+            "Fixture": f'{"H" if f["home"] else "A"} · {opp}',
+            "FDR": f["fdr"],
+            "Proj": round((row.get("projected_ppg") or 0.0) * _difficulty_factor(f["fdr"]), 2),
+        })
+    return ticker
+
+
+# ── Sidebar: global settings ────────────────────────────────────────────────────
 for _k, _default in (("gw_value", 1), ("skip_live_value", False),
-                      ("skip_summary_value", False), ("skip_chips_value", False)):
+                     ("skip_summary_value", False), ("skip_chips_value", False)):
     if _k not in st.session_state:
         st.session_state[_k] = _default
 
 with st.sidebar:
     st.header("⚽ IML Scorecards")
-    mode = st.radio("Mode", ["This Week's Matchups"], key="app_mode")
+    mode = st.radio("Mode", ["League Analytics", "This Week's Matchups"], key="app_mode")
+
+    bootstrap_sidebar = cached_bootstrap()
+    default_gw = current_or_next_gw(bootstrap_sidebar)
 
     st.divider()
     if mode == "This Week's Matchups":
         st.header("Gameweek")
         gw = st.number_input("Gameweek", min_value=1, max_value=38,
-                              value=st.session_state.gw_value, step=1, key="gw_input")
+                             value=int(st.session_state.gw_value or default_gw),
+                             step=1, key="gw_input")
         st.session_state.gw_value = gw
 
-        st.divider()
-        no_live = st.checkbox("Skip live scores", value=st.session_state.skip_live_value, key="skip_live",
-                               help="Use for a season that's fully finished, or to speed up testing.")
+        no_live = st.checkbox(
+            "Skip live scores",
+            value=st.session_state.skip_live_value,
+            key="skip_live",
+            help="Use for a finished season or faster testing.",
+        )
         st.session_state.skip_live_value = no_live
-        no_summary = st.checkbox("Skip squad summaries", value=st.session_state.skip_summary_value, key="skip_summary")
+        no_summary = st.checkbox(
+            "Skip squad summaries",
+            value=st.session_state.skip_summary_value,
+            key="skip_summary",
+        )
         st.session_state.skip_summary_value = no_summary
-        no_chips = st.checkbox("Skip chip tracker", value=st.session_state.skip_chips_value, key="skip_chips")
+        no_chips = st.checkbox(
+            "Skip chip tracker",
+            value=st.session_state.skip_chips_value,
+            key="skip_chips",
+        )
         st.session_state.skip_chips_value = no_chips
-
-        st.caption(
-            "Each PL fixture this gameweek gets its own tab, matched to the "
-            "20-team H2H roster. Open a tab, pick both captains, then Analyse."
-        )
     else:
-        st.caption(
-            "Pick your team to see your next PL fixture, your squad differential "
-            "against that opponent, and simulate captain/chip choices ahead of the deadline."
+        st.header("Analytics")
+        gw = st.number_input(
+            "Analysis gameweek",
+            min_value=1, max_value=38,
+            value=int(st.session_state.gw_value or default_gw),
+            step=1, key="analytics_gw",
         )
+        st.session_state.gw_value = gw
+        horizon = st.slider("Projection horizon (GWs)", 3, 8, 5, key="analytics_horizon")
+        ownership_threshold = st.slider(
+            "Highly-owned threshold (%)", 5.0, 40.0, 20.0, 2.5,
+            key="ownership_threshold",
+        )
+        st.caption(
+            "League Analytics provides forward-looking player, squad, manager and IML-wide analysis."
+        )
+
+# ── League analytics UI ─────────────────────────────────────────────────────────
+def _pre_gw_player_metric(pid, history, cutoff_gw):
+    """Build lightweight pre-GW metrics using history strictly through cutoff_gw."""
+    hist = [h for h in (history or []) if int(h.get("round") or 0) <= int(cutoff_gw)]
+    hist.sort(key=lambda h: int(h.get("round") or 0))
+    played = [h for h in hist if _safe_float(h.get("minutes")) > 0]
+    mins = sum(_safe_float(h.get("minutes")) for h in hist)
+    apps = len(played)
+    starts = sum(_safe_float(h.get("starts")) for h in hist)
+    avg_minutes = mins / apps if apps else 0.0
+    start_rate = starts / apps if apps else 0.0
+    min_sec = max(0.0, min(100.0, 100.0 * (0.62 * min(avg_minutes / 90.0, 1.0) + 0.38 * min(start_rate, 1.0))))
+
+    xg = sum(_safe_float(h.get("expected_goals")) for h in hist)
+    xa = sum(_safe_float(h.get("expected_assists")) for h in hist)
+    xg90 = 90.0 * xg / max(1.0, mins)
+    xa90 = 90.0 * xa / max(1.0, mins)
+    xgi90 = xg90 + xa90
+
+    dc_values = [_safe_float(h.get("defensive_contribution")) for h in played]
+    dc90 = 90.0 * sum(dc_values) / max(1.0, mins)
+    pos = None
+    # position is supplied by caller later; use threshold in caller if needed.
+
+    recent = played[-5:]
+    recent_ppg = sum(_safe_float(h.get("total_points")) for h in recent) / len(recent) if recent else 0.0
+    form_vals = [ _safe_float(h.get("total_points")) for h in recent ]
+    mean = sum(form_vals) / len(form_vals) if form_vals else 0.0
+    stdev = (sum((x-mean)**2 for x in form_vals)/len(form_vals))**0.5 if form_vals else 0.0
+    stability = 1.0 / (1.0 + stdev / max(1.0, mean)) if form_vals else 0.5
+
+    ict_vals = [_safe_float(h.get("ict_index")) for h in recent if h.get("ict_index") not in (None, "")]
+    inf_vals = [_safe_float(h.get("influence")) for h in recent if h.get("influence") not in (None, "")]
+    cre_vals = [_safe_float(h.get("creativity")) for h in recent if h.get("creativity") not in (None, "")]
+    thr_vals = [_safe_float(h.get("threat")) for h in recent if h.get("threat") not in (None, "")]
+
+    return {
+        "history": hist,
+        "minutes_security": min_sec,
+        "xg90": xg90,
+        "xa90": xa90,
+        "xgi90": xgi90,
+        "dc90": dc90,
+        "recent_ppg": recent_ppg,
+        "stability": stability,
+        "ict": sum(ict_vals)/len(ict_vals) if ict_vals else 0.0,
+        "influence": sum(inf_vals)/len(inf_vals) if inf_vals else 0.0,
+        "creativity": sum(cre_vals)/len(cre_vals) if cre_vals else 0.0,
+        "threat": sum(thr_vals)/len(thr_vals) if thr_vals else 0.0,
+    }
+
+
+def _build_simple_scout_rows(team_a, team_b, gw, horizon=1):
+    """Fast pre-GW differential board: only two 4-manager squads + their players."""
+    bootstrap = cached_bootstrap()
+    player_map = cached_player_map(bootstrap)
+    cutoff = max(0, int(gw) - 1)
+    fixture_data = cached_fixtures_all()
+    teams = _team_name_map(bootstrap)
+
+    ma = cached_league_managers(TEAMS[team_a]["league_id"])
+    mb = cached_league_managers(TEAMS[team_b]["league_id"])
+    ids_a = tuple(str(m["id"]) for m in ma)
+    ids_b = tuple(str(m["id"]) for m in mb)
+
+    # CRITICAL: GW N analysis uses GW N-1 squad state.
+    pa = cached_team_picks(ids_a, -1, max(1, cutoff), "A", player_map, ma)
+    pb = cached_team_picks(ids_b, -1, max(1, cutoff), "B", player_map, mb)
+
+    def ownership(picks):
+        out = defaultdict(int)
+        for mgr in picks:
+            for p in mgr.get("picks", []):
+                out[int(p["element"])] += 1
+        return out
+
+    oa, ob = ownership(pa), ownership(pb)
+    player_ids = tuple(sorted(set(oa) | set(ob)))
+    summaries = cached_player_summaries(player_ids)
+    analytics_rows = {r["id"]: r for r in []}
+
+    # Fixture index for GW N onward.
+    fx_idx = _fixture_index(fixture_data)
+    rows = []
+    for pid in player_ids:
+        p = next((x for x in bootstrap.get("elements", []) if int(x["id"]) == pid), None)
+        if not p:
+            continue
+        pos = engine.POSITIONS.get(p.get("element_type"), "?")
+        metrics = _pre_gw_player_metric(pid, (summaries.get(pid) or {}).get("history", []), cutoff)
+        threshold = _defcon_threshold(pos)
+        played = metrics["history"]
+        defcon_hits = [h for h in played if _safe_float(h.get("minutes")) > 0 and _safe_float(h.get("defensive_contribution")) >= threshold]
+        def_rel = len(defcon_hits) / max(1, len([h for h in played if _safe_float(h.get("minutes")) > 0])) * 100.0
+
+        next_fixtures = [f for f in fx_idx.get(int(p.get("team") or 0), []) if f["event"] >= int(gw) and not f["finished"]][:max(1, horizon)]
+        fixture = next_fixtures[0] if next_fixtures else None
+        fdr = int(fixture["fdr"]) if fixture else 3
+        # Same transparent style as the core projection, but strictly historical through N-1.
+        baseline = metrics["recent_ppg"]
+        underlying = 1.55 * metrics["xgi90"] + 0.10 * metrics["dc90"]
+        minutes_factor = 0.62 + 0.38 * metrics["minutes_security"] / 100.0
+        proj = max(0.0, (baseline + underlying) * minutes_factor * _difficulty_factor(fdr))
+        if pos in ("GKP", "DEF"):
+            proj += 0.18 * (def_rel / 100.0)
+
+        ict = metrics["ict"]
+        # ICT is normalized against the observed scout pool later; keep raw FPL ICT here.
+        own_a, own_b = oa.get(pid, 0), ob.get(pid, 0)
+        diff = own_a - own_b
+        swing = diff * proj
+        rows.append({
+            "id": pid,
+            "name": p.get("web_name") or f"#{pid}",
+            "position": pos,
+            "club": teams.get(int(p.get("team") or 0), "?"),
+            "mine": own_a,
+            "opp": own_b,
+            "diff": diff,
+            "projected": proj,
+            "minutes_security": metrics["minutes_security"],
+            "xg90": metrics["xg90"],
+            "xa90": metrics["xa90"],
+            "xgi90": metrics["xgi90"],
+            "defcon_reliability": def_rel,
+            "fdr": fdr,
+            "ict": ict,
+            "influence": metrics["influence"],
+            "creativity": metrics["creativity"],
+            "threat": metrics["threat"],
+            "expected_swing": swing,
+            "fixture": fixture,
+        })
+
+    # ICT percentile is relative to this actual matchup pool, not the whole universe.
+    ict_sorted = sorted([r["ict"] for r in rows])
+    for r in rows:
+        if ict_sorted:
+            le = sum(v <= r["ict"] for v in ict_sorted)
+            r["ict_percentile"] = 100.0 * le / len(ict_sorted)
+        else:
+            r["ict_percentile"] = 0.0
+
+    rows.sort(key=lambda r: (-abs(r["expected_swing"]), -r["projected"], r["name"]))
+    return rows, ma, mb, pa, pb, cutoff
+
+
+def render_league_analytics(gw: int, horizon: int, ownership_threshold: float):
+    st.subheader("⚔️ Differential Board — Next Opponent Scout")
+    st.caption(
+        f"Pre-GW{gw} scouting: player statistics and squad state are locked through GW{max(0, gw-1)}. "
+        "GW{0}+ is used only for fixtures and forward projection.".format(gw)
+    )
+
+    # Pick the user's IML side, then automatically identify the PL/IML opponent for the selected GW.
+    team_names = sorted(TEAMS.keys())
+    default_team = st.selectbox("My IML team", team_names, key="scout_my_team")
+    matchups = gw_matchups(int(gw))
+    auto_opp = None
+    for m in matchups:
+        if m["team_a"] == default_team:
+            auto_opp = m["team_b"]
+            break
+        if m["team_b"] == default_team:
+            auto_opp = m["team_a"]
+            break
+    candidates = [x for x in team_names if x != default_team]
+    opponent = st.selectbox("Opponent", candidates, index=(candidates.index(auto_opp) if auto_opp in candidates else 0), key="scout_opponent")
+
+    if st.button(f"Load GW{gw} matchup", type="primary", key="scout_load"):
+        st.session_state["scout_loaded"] = (default_team, opponent, int(gw), int(horizon))
+
+    loaded = st.session_state.get("scout_loaded")
+    if not loaded:
+        st.info("Select your team and opponent, then load the matchup.")
+        return
+    my_team, opp_team, load_gw, load_horizon = loaded
+    try:
+        with st.spinner("Loading the 8 squads and building the differential table…"):
+            rows, managers_a, managers_b, picks_a, picks_b, cutoff = _build_simple_scout_rows(my_team, opp_team, load_gw, load_horizon)
+    except Exception as e:
+        st.error(f"Couldn't build the matchup: {e}")
+        return
+
+    if not rows:
+        st.warning("No players could be loaded for this matchup.")
+        return
+
+    projected_a = sum(r["projected"] * r["mine"] for r in rows)
+    projected_b = sum(r["projected"] * r["opp"] for r in rows)
+    margin = projected_a - projected_b
+    result_state = "WIN" if margin >= 6 else "DRAW" if margin >= -5 else "LOSS"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(my_team, f"{projected_a:.1f}")
+    c2.metric(opp_team, f"{projected_b:.1f}")
+    c3.metric("Projected margin", f"{margin:+.1f}")
+    c4.metric("IML state", result_state)
+
+    st.markdown(f"### {my_team} vs {opp_team} — GW{load_gw}")
+    st.caption(f"Stats cutoff: GW{cutoff}. FDR/fixture shown for GW{load_gw}; no GW{load_gw} performance is used.")
+
+    df = pd.DataFrame(rows)
+    show = df[[
+        "name", "position", "club", "mine", "opp", "diff", "projected",
+        "minutes_security", "xg90", "xa90", "xgi90", "defcon_reliability",
+        "ict", "ict_percentile", "fdr", "expected_swing"
+    ]].copy()
+    show.columns = [
+        "Player", "Pos", "Club", "Mine", "Opp", "Diff", "xPts",
+        "Min Security %", "xG90", "xA90", "xGI90", "DEFCON Rel. %",
+        "ICT", "ICT %ile", "FDR", "Expected Swing"
+    ]
+    for col in ["xPts", "Min Security %", "xG90", "xA90", "xGI90", "DEFCON Rel. %", "ICT", "ICT %ile", "Expected Swing"]:
+        show[col] = show[col].round(2)
+
+    def _swing_style(v):
+        if v > 0:
+            return "color: #1a8754; font-weight: 700"
+        if v < 0:
+            return "color: #c0392b; font-weight: 700"
+        return "color: #6b7280"
+
+    st.dataframe(show.style.map(_swing_style, subset=["Expected Swing"]), hide_index=True, width="stretch", height=620)
+
+    st.markdown("#### Swing Board")
+    chart = df.head(15).sort_values("expected_swing")
+    fig = go.Figure(go.Bar(
+        x=chart["expected_swing"], y=chart["name"], orientation="h",
+        text=[f"{x:+.1f}" for x in chart["expected_swing"]], textposition="outside"
+    ))
+    fig.add_vline(x=0, line_dash="dot")
+    fig.update_layout(height=max(360, 26 * len(chart)), margin=dict(l=0, r=50, t=20, b=0), xaxis_title="Expected H2H swing (pts)")
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("#### Biggest matchup levers")
+    biggest_for = sorted([r for r in rows if r["expected_swing"] > 0], key=lambda r: -r["expected_swing"])[:3]
+    biggest_against = sorted([r for r in rows if r["expected_swing"] < 0], key=lambda r: r["expected_swing"])[:3]
+    a, b = st.columns(2)
+    with a:
+        st.markdown("**🟢 Opportunities**")
+        for r in biggest_for:
+            st.write(f"**{r['name']}** · +{r['expected_swing']:.1f} swing · ICT {r['ict']:.0f} · xPts {r['projected']:.1f}")
+    with b:
+        st.markdown("**🔴 Threats**")
+        for r in biggest_against:
+            st.write(f"**{r['name']}** · {r['expected_swing']:.1f} swing · ICT {r['ict']:.0f} · xPts {r['projected']:.1f}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-
 st.title("IML Scorecards")
-st.caption("Head-to-head ownership & point-swing analyser — 2026/27 season")
+st.caption("H2H ownership, player projections and IML-wide decision intelligence — 2026/27")
 
-if mode == "This Week's Matchups":
-    render_weekly_matchups(int(gw), no_live, no_summary, no_chips)
+if mode == "League Analytics":
+    render_league_analytics(int(gw), int(horizon), float(ownership_threshold))
 else:
-    render_planner_mode()
+    render_weekly_matchups(int(gw), no_live, no_summary, no_chips)
