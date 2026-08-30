@@ -46,7 +46,7 @@ TEAMS = {
     "Bournemouth":              {"league_id": "729033",  "managers": ["Sarthak Grover", "Soumil Mendiratta", "Parameshwar Hembram", "Chandrashekhar Ramadoss"]},
     "Brentford":                {"league_id": "705820",  "managers": ["Sannan Shah", "Sheikh Usmaan", "Amaan Seven", "Aflaq Shah"]},
     "Brighton and Hove Albion": {"league_id": "906398",  "managers": ["Mukul Kundu", "Nishanth G Suseelan", "Shivam Pahuja", "Abhijeet Kundu"]},
-    "Chelsea":                  {"league_id": "1560363", "managers": ["Shashwat Prakash Dubey", "Amitash Srivastava", "Sourav Hemran", "Winayak Kumar"]},
+    "Chelsea":                  {"league_id": "1560363", "managers": ["Shashwat Prakash Dubey", "Amitash Srivastava", "Sourav Hemram", "Winayak Kumar"]},
     "Coventry City":            {"league_id": "1388324", "managers": ["Sreejan Deb", "Sunny Das", "Debanjan Dutta", "Rohit Sengupta"]},
     "Crystal Palace":           {"league_id": "944252",  "managers": ["Arish Mehta", "Aryaman Arora", "sidhanth muralidhar", "Farhan ul Haq"]},
     "Everton":                  {"league_id": "706707",  "managers": ["Ayush Falor", "Dylan M", "Gau Mohanty", "Rizwan Azavedo"]},
